@@ -33,6 +33,32 @@ The [workflow](.github/workflows/repro.yml) runs four cases with a PostgreSQL 17
 
 A job passes when the expected outcome is observed. Each run uploads its evidence: broker logs, the WARN stack, the thread dump showing `doRecover`, `samples.tsv`, and the heap dump (`.hprof.xz`) when one is written.
 
+## Results
+
+From [run 36845523696](https://github.com/papinifrancesco/activemq-jdbc-topic-expiry-oom/actions/runs/36845523696). The evidence is kept permanently in the [`evidence-2026-10-01` release](https://github.com/papinifrancesco/activemq-jdbc-topic-expiry-oom/releases/tag/evidence-2026-10-01).
+
+| ActiveMQ | Store | `expireMessagesPeriod` | Outcome (1 GB heap, 200,000 × 5 KB messages offered) |
+|---|---|---|---|
+| 6.2.10 | JDBC / PostgreSQL | default | `OutOfMemoryError` at ~86,000 stored rows. `WARN Failed to browse Topic: repro.topic`, browse caught 3× inside `DefaultJDBCAdapter.doRecover` |
+| 6.3.2 | JDBC / PostgreSQL | default | `OutOfMemoryError` at ~89,000 stored rows, broker exits. Same stack, caught 3× |
+| 6.2.10 | JDBC / PostgreSQL | `0` | all 200,000 rows stored, no OOM, broker up |
+| 6.2.10 | KahaDB | default | all messages stored, no OOM, broker up |
+
+Eclipse MAT "Leak Suspects" on the 6.2.10 heap dump (report in the release): the thread `ActiveMQ BrokerService[repro] Task-3` retains **53.8% of the heap (574 MB)** in one `ArrayList` of **54,343 `org.postgresql.core.Tuple`**, one per row. The driver was still receiving the ~86,000-row result set inside `executeQuery()` when the heap ran out. Its stack:
+
+```
+at org.postgresql.core.v3.QueryExecutorImpl.processResults(QueryExecutorImpl.java:2623)
+at org.postgresql.jdbc.PgPreparedStatement.executeQuery(PgPreparedStatement.java:140)
+at org.apache.commons.dbcp2.DelegatingPreparedStatement.executeQuery(DelegatingPreparedStatement.java:123)
+at org.apache.activemq.store.jdbc.adapter.DefaultJDBCAdapter.doRecover(DefaultJDBCAdapter.java:406)
+at org.apache.activemq.store.jdbc.JDBCMessageStore.recover(JDBCMessageStore.java:279)
+at org.apache.activemq.store.ProxyTopicMessageStore.recover(ProxyTopicMessageStore.java:63)
+at org.apache.activemq.broker.region.Topic.doBrowse(Topic.java:691)
+at org.apache.activemq.broker.region.Topic.lambda$new$2(Topic.java:950)
+```
+
+The heap dumps contain only the synthetic messages. The broker runs with a stripped environment, and the database credentials are the throwaway `repro`/`repro`.
+
 ## Run it locally
 
 Needs bash, curl, tar, xz, a JDK 17+ in `JAVA_HOME` (for `jcmd`) and a PostgreSQL you can drop tables in:
