@@ -35,9 +35,12 @@ log "load: $THREADS x $PER_THREAD persistent messages of $MSG_SIZE bytes, no TTL
 
 # --- 1. ActiveMQ binary distribution, verified against the published sha512 ------------------
 TGZ="apache-activemq-$AMQ_VERSION-bin.tar.gz"
-BASE="https://archive.apache.org/dist/activemq/$AMQ_VERSION"
-[ -f "$WORK/$TGZ" ] || curl -fsSL -o "$WORK/$TGZ" "$BASE/$TGZ"
-want=$(curl -fsSL "$BASE/$TGZ.sha512" | grep -oE '[0-9a-f]{128}' | head -1)
+ARCHIVE="https://archive.apache.org/dist/activemq/$AMQ_VERSION"   # complete but throttled
+CDN="https://dlcdn.apache.org/activemq/$AMQ_VERSION"                # fast, current releases only
+if [ ! -f "$WORK/$TGZ" ]; then
+  curl -fsSL -o "$WORK/$TGZ" "$CDN/$TGZ" || curl -fsSL -o "$WORK/$TGZ" "$ARCHIVE/$TGZ"
+fi
+want=$(curl -fsSL "$ARCHIVE/$TGZ.sha512" | grep -oE '[0-9a-f]{128}' | head -1)
 have=$(sha512sum "$WORK/$TGZ" | cut -d' ' -f1)
 [ "$want" = "$have" ] || { log "sha512 mismatch for $TGZ"; exit 2; }
 AMQ="$WORK/apache-activemq-$AMQ_VERSION"
@@ -65,18 +68,19 @@ cp "$WORK/activemq.xml" "$OUT/activemq.xml"
 
 # --- 4. start the broker with a STRIPPED environment (the heap dump must hold nothing else) ----
 mkdir -p "$WORK/home"
+T_START=$(date +%s)
 env -i PATH=/usr/bin:/bin HOME="$WORK/home" JAVA_HOME="$JAVA_HOME" \
   ACTIVEMQ_OPTS_MEMORY="-Xms64M -Xmx$HEAP -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=$OUT" \
   "$AMQ/bin/activemq" console "xbean:file:$WORK/activemq.xml" > "$OUT/broker-console.log" 2>&1 &
 for _ in $(seq 1 90); do (exec 3<>/dev/tcp/127.0.0.1/61616) 2>/dev/null && break; sleep 2; done
 PID=$(pgrep -f "activemq\.jar.*xbean:file:$WORK/activemq.xml" | head -1 || true)
 [ -n "$PID" ] || { log "broker did not start"; cat "$OUT/broker-console.log"; exit 2; }
-log "broker up, pid $PID"
+log "broker up, pid $PID ($(( $(date +%s) - T_START ))s after start)"
 
-cli() { ACTIVEMQ_OPTS_MEMORY="-Xmx256M" "$AMQ/bin/activemq" "$@"; }
+CLI=(env ACTIVEMQ_OPTS_MEMORY=-Xmx256M "$AMQ/bin/activemq")   # an array, so timeout can run it
 
 # --- 5. one durable subscriber, then disconnect it (offline: the backlog stays in the store) ---
-timeout 120 cli consumer --brokerUrl "$BROKER_URL" --destination "topic://$TOPIC" \
+timeout 120 "${CLI[@]}" consumer --brokerUrl "$BROKER_URL" --destination "topic://$TOPIC" \
   --durable true --clientId repro-client --messageCount 0 > "$OUT/consumer.log" 2>&1
 log "offline durable subscription created"
 
@@ -98,7 +102,7 @@ printf 'utc\tstore_rows\theap_used_kb\n' > "$OUT/samples.tsv"
 SAMPLER=$!
 
 # --- 7. load ---------------------------------------------------------------------------------
-cli producer --brokerUrl "$BROKER_URL" --destination "topic://$TOPIC" --persistent true \
+"${CLI[@]}" producer --brokerUrl "$BROKER_URL" --destination "topic://$TOPIC" --persistent true \
   --messageCount "$PER_THREAD" --messageSize "$MSG_SIZE" --parallelThreads "$THREADS" \
   > "$OUT/producer.log" 2>&1 &
 PRODUCER=$!
