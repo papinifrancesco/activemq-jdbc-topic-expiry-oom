@@ -1,0 +1,57 @@
+name: repro
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: ${{ matrix.amq }} ${{ matrix.store }} expire=${{ matrix.expire }} (expect ${{ matrix.expect }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { amq: 6.2.10, store: jdbc,   expire: default, expect: oom }
+          - { amq: 6.3.2,  store: jdbc,   expire: default, expect: oom }
+          - { amq: 6.2.10, store: jdbc,   expire: "0",     expect: survive }
+          - { amq: 6.2.10, store: kahadb, expire: default, expect: survive }
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: repro
+          POSTGRES_PASSWORD: repro
+          POSTGRES_DB: repro
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U repro" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Reproduce
+        env:
+          AMQ_VERSION: ${{ matrix.amq }}
+          STORE: ${{ matrix.store }}
+          EXPIRE_PERIOD: ${{ matrix.expire }}
+          EXPECT: ${{ matrix.expect }}
+          PSQL: docker exec -i ${{ job.services.postgres.id }} psql -U repro -d repro
+        run: bash ./repro.sh
+      - name: Summary
+        if: always()
+        run: cat out/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ matrix.amq }}-${{ matrix.store }}-expire-${{ matrix.expire }}
+          path: out/
+          retention-days: 90

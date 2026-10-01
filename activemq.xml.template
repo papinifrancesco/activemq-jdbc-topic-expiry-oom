@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimal broker for the reproduction. repro.sh fills in the @...@ placeholders.
+  The DBCP2 data source keeps its defaults (autocommit on, no defaultRowFetchSize),
+  which is how a JDBC store is normally configured.
+-->
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+                           http://activemq.apache.org/schema/core http://activemq.apache.org/schema/core/activemq-core.xsd">
+
+  <bean id="pg-ds" class="org.apache.commons.dbcp2.BasicDataSource" destroy-method="close">
+    <property name="driverClassName" value="org.postgresql.Driver"/>
+    <property name="url" value="@PGURL@"/>
+    <property name="username" value="@PGUSER@"/>
+    <property name="password" value="@PGPASSWORD@"/>
+    <property name="maxTotal" value="20"/>
+  </bean>
+
+  <broker xmlns="http://activemq.apache.org/schema/core" brokerName="repro" dataDirectory="@DATA@">
+
+    <destinationPolicy>
+      <policyMap>
+        <policyEntries>
+          <!-- @EXPIRE_ATTR@ is empty for the broker default (30000 ms) -->
+          <policyEntry topic="&gt;" producerFlowControl="false" @EXPIRE_ATTR@/>
+        </policyEntries>
+      </policyMap>
+    </destinationPolicy>
+
+    <persistenceAdapter>
+      @PERSISTENCE@
+    </persistenceAdapter>
+
+    <systemUsage>
+      <systemUsage>
+        <memoryUsage><memoryUsage percentOfJvmHeap="70"/></memoryUsage>
+        <storeUsage><storeUsage limit="20 gb"/></storeUsage>
+        <tempUsage><tempUsage limit="5 gb"/></tempUsage>
+      </systemUsage>
+    </systemUsage>
+
+    <transportConnectors>
+      <transportConnector name="openwire" uri="tcp://127.0.0.1:61616"/>
+    </transportConnectors>
+  </broker>
+</beans>
