@@ -4,7 +4,7 @@ Reproduction for an Apache ActiveMQ bug. When the broker uses the **JDBC persist
 
 - Affected: 6.2.10 and 6.3.2 (both tested here). The code path has been the same since [AMQ-9698](https://issues.apache.org/jira/browse/AMQ-9698) (6.2.0).
 - Related: [AMQ-6067](https://issues.apache.org/jira/browse/AMQ-6067), the same symptom on Oracle, fixed in 5.14.1 by stopping the recovery loop after `maxExpirePageSize` rows. That fix cannot help on PostgreSQL: the driver buffers the full result set inside `executeQuery()`, before the loop sees the first row.
-- Issue: _link added after filing_
+- Issue: [apache/activemq#2630](https://github.com/apache/activemq/issues/2630)
 
 ## The code path
 
