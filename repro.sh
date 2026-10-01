@@ -10,9 +10,9 @@ AMQ_VERSION=${AMQ_VERSION:-6.2.10}
 STORE=${STORE:-jdbc}                  # jdbc | kahadb
 EXPIRE_PERIOD=${EXPIRE_PERIOD:-default}  # default (broker default, 30000 ms) | milliseconds, e.g. 0
 EXPECT=${EXPECT:-oom}                 # oom | survive
-HEAP=${HEAP:-512M}
+HEAP=${HEAP:-1G}
 THREADS=${THREADS:-4}                 # producer threads
-PER_THREAD=${PER_THREAD:-40000}       # messages per producer thread
+PER_THREAD=${PER_THREAD:-50000}       # messages per producer thread
 MSG_SIZE=${MSG_SIZE:-5000}            # bytes per message
 PGHOST=${PGHOST:-127.0.0.1}; PGPORT=${PGPORT:-5432}
 PGDATABASE=${PGDATABASE:-repro}; PGUSER=${PGUSER:-repro}; PGPASSWORD=${PGPASSWORD:-repro}
@@ -91,15 +91,23 @@ printf 'utc\tstore_rows\theap_used_kb\n' > "$OUT/samples.tsv"
     rows=-; [ "$STORE" = jdbc ] && rows=$(sql "SELECT count(*) FROM activemq_msgs")
     used=$(timeout 10 "$JAVA_HOME/bin/jcmd" "$PID" GC.heap_info 2>/dev/null | grep -oE 'used [0-9]+K' | head -1 | tr -dc 0-9)
     printf '%s\t%s\t%s\n' "$(date -u +%H:%M:%S)" "${rows:--}" "${used:--}" >> "$OUT/samples.tsv"
-    if [ ! -f "$OUT/thread-dump-doRecover.txt" ] && \
-       timeout 15 "$JAVA_HOME/bin/jcmd" "$PID" Thread.print > "$OUT/.td" 2>/dev/null && \
-       grep -q 'DefaultJDBCAdapter.doRecover' "$OUT/.td"; then
-      mv "$OUT/.td" "$OUT/thread-dump-doRecover.txt"
-    fi
     sleep 5
   done
 ) &
 SAMPLER=$!
+# The expiry browse lasts only a second or two, so thread dumps are taken every second.
+# Up to 3 dumps that catch Topic.doBrowse are kept (thread-dump-browse-N.txt).
+(
+  n=0
+  while kill -0 "$PID" 2>/dev/null && [ "$n" -lt 3 ]; do
+    if timeout 10 "$JAVA_HOME/bin/jcmd" "$PID" Thread.print > "$OUT/.td" 2>/dev/null && \
+       grep -q 'Topic.doBrowse' "$OUT/.td"; then
+      n=$((n + 1)); { echo "# taken $(date -u +%H:%M:%S) UTC"; cat "$OUT/.td"; } > "$OUT/thread-dump-browse-$n.txt"
+    fi
+    sleep 1
+  done
+) &
+DUMPER=$!
 
 # --- 7. load ---------------------------------------------------------------------------------
 "${CLI[@]}" producer --brokerUrl "$BROKER_URL" --destination "topic://$TOPIC" --persistent true \
@@ -115,7 +123,7 @@ if ! oom; then
   for _ in $(seq 1 18); do oom && break; sleep 5; done
 fi
 sleep 10                                   # let the heap dump finish and the WARN reach the log
-PRODUCED=$(grep -c 'Produced: ' "$OUT/producer.log" || true)
+LAST_ROWS=$(awk -F'\t' 'NR>1 && $2!="-" {r=$2} END {print (r=="" ? "-" : r)}' "$OUT/samples.tsv")
 ROWS=-; [ "$STORE" = jdbc ] && ROWS=$(sql "SELECT count(*) FROM activemq_msgs")
 ALIVE=no; kill -0 "$PID" 2>/dev/null && ALIVE=yes
 
@@ -124,9 +132,9 @@ cp "$AMQ/data/activemq.log" "$OUT/activemq.log" 2>/dev/null || true
 grep -h -A 40 -E 'Failed to (browse|expire messages on) Topic' "$OUT/activemq.log" "$OUT/broker-console.log" \
   2>/dev/null | head -60 > "$OUT/oom-warn.txt" || true
 STACK=no
-grep -q 'DefaultJDBCAdapter.doRecover' "$OUT/oom-warn.txt" "$OUT/thread-dump-doRecover.txt" 2>/dev/null && STACK=yes
+grep -q 'DefaultJDBCAdapter.doRecover' "$OUT/oom-warn.txt" "$OUT"/thread-dump-browse-*.txt 2>/dev/null && STACK=yes
 OOM=no; oom && OOM=yes
-kill "$SAMPLER" "$PRODUCER" 2>/dev/null || true; kill -9 "$PID" 2>/dev/null || true
+kill "$SAMPLER" "$DUMPER" "$PRODUCER" 2>/dev/null || true; kill -9 "$PID" 2>/dev/null || true
 for f in "$OUT"/*.hprof; do if [ -f "$f" ]; then xz -T0 -6 "$f"; fi; done
 rm -f "$OUT/.td"
 
@@ -142,12 +150,19 @@ else [ "$OOM" = no ] && [ "$ALIVE" = yes ] && PASS=yes; fi
   echo "| OutOfMemoryError | $OOM |"
   echo "| doRecover on the OOM path (WARN stack or thread dump) | $STACK |"
   echo "| broker alive at the end | $ALIVE |"
-  echo "| producer 'Produced:' lines | $PRODUCED |"
+  echo "| store rows at the last sample before the end/OOM | $LAST_ROWS |"
+  echo "| thread dumps that caught Topic.doBrowse | $(ls "$OUT"/thread-dump-browse-*.txt 2>/dev/null | wc -l) |"
   echo "| rows in activemq_msgs at the end | $ROWS |"
   echo "| heap | $HEAP |"
   echo "| **result** | **$( [ $PASS = yes ] && echo PASS || echo FAIL )** |"
   echo
-  if [ -s "$OUT/oom-warn.txt" ]; then echo '```'; head -30 "$OUT/oom-warn.txt"; echo '```'; fi
+  if [ -s "$OUT/oom-warn.txt" ]; then echo '```'; grep -m3 -A1 'Failed to' "$OUT/oom-warn.txt"; echo '```'; fi
+  td=$(ls "$OUT"/thread-dump-browse-*.txt 2>/dev/null | head -1)
+  if [ -n "$td" ]; then
+    echo; echo "Thread caught in the expiry browse ($(basename "$td")):"; echo '```'
+    awk 'BEGIN{RS=""} /Topic\.doBrowse/' "$td" | grep -E '^"|at (org\.postgresql|org\.apache\.(activemq|commons\.dbcp2))' | head -25
+    echo '```'
+  fi
 } > "$OUT/summary.md"
 cat "$OUT/summary.md"
 [ "$PASS" = yes ]

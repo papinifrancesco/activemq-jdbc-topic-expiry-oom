@@ -17,10 +17,10 @@ Reproduction for an Apache ActiveMQ bug. When the broker uses the **JDBC persist
 `repro.sh`, the same script locally and in CI:
 
 1. Downloads the official binary distribution and checks it against Apache's published sha512. Downloads pgjdbc 42.7.13 and checks its sha256.
-2. Starts a broker with a 512 MB heap, the JDBC store on PostgreSQL, default data-source settings and the default `expireMessagesPeriod`. The broker runs with a stripped environment, so the heap dump holds only synthetic data.
+2. Starts a broker with a 1 GB heap, the JDBC store on PostgreSQL, default data-source settings and the default `expireMessagesPeriod`. The broker runs with a stripped environment, so the heap dump holds only synthetic data.
 3. Registers one durable subscriber with the stock CLI (`activemq consumer --durable true --messageCount 0`), which then disconnects.
-4. Publishes 4 × 40,000 persistent 5,000-byte messages with no TTL (`activemq producer`).
-5. Samples the store row count, heap use and thread dumps every 5 s. Records whether an `OutOfMemoryError` happens and whether `DefaultJDBCAdapter.doRecover` is on its path (the broker's WARN stack trace or a thread dump).
+4. Publishes 4 × 50,000 persistent 5,000-byte messages with no TTL (`activemq producer`).
+5. Samples the store row count and heap use every 5 s, and takes a thread dump every second to catch the expiry browse in the act. Records whether an `OutOfMemoryError` happens and whether `DefaultJDBCAdapter.doRecover` is on its path (the broker's WARN stack trace or a thread dump).
 
 The [workflow](.github/workflows/repro.yml) runs four cases with a PostgreSQL 17 service container:
 
@@ -44,7 +44,7 @@ EXPIRE_PERIOD=0 EXPECT=survive ./repro.sh
 STORE=kahadb EXPECT=survive ./repro.sh
 ```
 
-Other knobs: `HEAP` (default `512M`), `THREADS`, `PER_THREAD`, `MSG_SIZE`. Results go to `out/`, with a summary in `out/summary.md`.
+Other knobs: `HEAP` (default `1G`), `THREADS`, `PER_THREAD`, `MSG_SIZE`. Results go to `out/`, with a summary in `out/summary.md`.
 
 ## Workaround
 
