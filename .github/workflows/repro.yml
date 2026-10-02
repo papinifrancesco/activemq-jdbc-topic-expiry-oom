@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   repro:
-    name: ${{ matrix.amq }} ${{ matrix.store }} expire=${{ matrix.expire }} (expect ${{ matrix.expect }})
+    name: ${{ matrix.amq }}${{ matrix.patched == 'yes' && ' + patch' || '' }} ${{ matrix.store }} expire=${{ matrix.expire }} ttl=${{ matrix.ttl || '0' }} (expect ${{ matrix.expect }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -20,6 +20,12 @@ jobs:
           - { amq: 6.3.2,  store: jdbc,   expire: default, expect: oom }
           - { amq: 6.2.10, store: jdbc,   expire: "0",     expect: survive }
           - { amq: 6.2.10, store: kahadb, expire: default, expect: survive }
+          # with TTLs the unpatched expiry browse still loads the whole backlog
+          - { amq: 6.3.2,  store: jdbc,   expire: default, ttl: "30000", expect: oom }
+          # patched: recoverExpired() for JDBC (patches/jdbc-recover-expired.patch)
+          - { amq: 6.3.2,  store: jdbc,   expire: default, patched: "yes", build_jdk: "25", expect: survive }
+          - { amq: 6.3.2,  store: jdbc,   expire: default, patched: "yes", build_jdk: "25", ttl: "30000", expect: expire }
+          - { amq: 6.2.10, store: jdbc,   expire: default, patched: "yes", build_jdk: "17", expect: survive }
     services:
       postgres:
         image: postgres:17
@@ -34,15 +40,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
+        if: matrix.patched == 'yes'
+        id: buildjdk
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.build_jdk }}
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+      - name: Build patched jars
+        if: matrix.patched == 'yes'
+        env:
+          AMQ_VERSION: ${{ matrix.amq }}
+          JAVA_HOME: ${{ steps.buildjdk.outputs.path }}
+        run: bash ./build-patched.sh
       - name: Reproduce
         env:
           AMQ_VERSION: ${{ matrix.amq }}
           STORE: ${{ matrix.store }}
           EXPIRE_PERIOD: ${{ matrix.expire }}
           EXPECT: ${{ matrix.expect }}
+          PATCHED: ${{ matrix.patched || 'no' }}
+          TTL: ${{ matrix.ttl || '0' }}
           PSQL: docker exec -i ${{ job.services.postgres.id }} psql -U repro -d repro
         run: bash ./repro.sh
       - name: Summary
@@ -52,6 +72,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evidence-${{ matrix.amq }}-${{ matrix.store }}-expire-${{ matrix.expire }}
+          name: evidence-${{ matrix.amq }}${{ matrix.patched == 'yes' && '-patched' || '' }}-${{ matrix.store }}-expire-${{ matrix.expire }}-ttl-${{ matrix.ttl || '0' }}
           path: out/
           retention-days: 90

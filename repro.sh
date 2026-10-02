@@ -9,7 +9,9 @@ set -euo pipefail
 AMQ_VERSION=${AMQ_VERSION:-6.2.10}
 STORE=${STORE:-jdbc}                  # jdbc | kahadb
 EXPIRE_PERIOD=${EXPIRE_PERIOD:-default}  # default (broker default, 30000 ms) | milliseconds, e.g. 0
-EXPECT=${EXPECT:-oom}                 # oom | survive
+EXPECT=${EXPECT:-oom}                 # oom | survive | expire (survive AND expiry acks messages)
+PATCHED=${PATCHED:-no}                # yes: use the jars built by build-patched.sh (work/patched)
+TTL=${TTL:-0}                         # message time to live in ms, 0 = never expires
 HEAP=${HEAP:-1G}
 THREADS=${THREADS:-4}                 # producer threads
 PER_THREAD=${PER_THREAD:-50000}       # messages per producer thread
@@ -30,8 +32,8 @@ log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$OUT/repro.log"; }
 sql() { eval "$PSQL -tAc \"$1\"" 2>/dev/null | tr -d '[:space:]' || true; }
 
 rm -rf "$OUT"; mkdir -p "$WORK" "$OUT"
-log "ActiveMQ $AMQ_VERSION, store=$STORE, expireMessagesPeriod=$EXPIRE_PERIOD, expect=$EXPECT, heap=$HEAP"
-log "load: $THREADS x $PER_THREAD persistent messages of $MSG_SIZE bytes, no TTL, one OFFLINE durable subscriber"
+log "ActiveMQ $AMQ_VERSION, patched=$PATCHED, store=$STORE, expireMessagesPeriod=$EXPIRE_PERIOD, expect=$EXPECT, heap=$HEAP"
+log "load: $THREADS x $PER_THREAD persistent messages of $MSG_SIZE bytes, TTL=$TTL ms, one OFFLINE durable subscriber"
 
 # --- 1. ActiveMQ binary distribution, verified against the published sha512 ------------------
 TGZ="apache-activemq-$AMQ_VERSION-bin.tar.gz"
@@ -45,6 +47,11 @@ have=$(sha512sum "$WORK/$TGZ" | cut -d' ' -f1)
 [ "$want" = "$have" ] || { log "sha512 mismatch for $TGZ"; exit 2; }
 AMQ="$WORK/apache-activemq-$AMQ_VERSION"
 rm -rf "$AMQ"; tar -xzf "$WORK/$TGZ" -C "$WORK"
+if [ "$PATCHED" = yes ]; then
+  cp "$WORK/patched/activemq-broker-$AMQ_VERSION.jar" "$AMQ/lib/"
+  cp "$WORK/patched/activemq-jdbc-store-$AMQ_VERSION.jar" "$AMQ/lib/optional/"
+  log "patched jars in place: $(cd "$AMQ" && sha256sum lib/activemq-broker-*.jar lib/optional/activemq-jdbc-store-*.jar | awk '{printf "%s %.12s  ", $2, $1}')"
+fi
 
 # --- 2. PostgreSQL JDBC driver, verified ----------------------------------------------------
 JAR="$WORK/postgresql-$PGJDBC_VERSION.jar"
@@ -115,7 +122,7 @@ DUMPER=$!
 
 # --- 7. load ---------------------------------------------------------------------------------
 "${CLI[@]}" producer --brokerUrl "$BROKER_URL" --destination "topic://$TOPIC" --persistent true \
-  --messageCount "$PER_THREAD" --messageSize "$MSG_SIZE" --parallelThreads "$THREADS" \
+  --messageCount "$PER_THREAD" --messageSize "$MSG_SIZE" --parallelThreads "$THREADS" --msgTTL "$TTL" \
   > "$OUT/producer.log" 2>&1 &
 PRODUCER=$!
 oom() { grep -q 'java.lang.OutOfMemoryError' "$OUT/broker-console.log" "$AMQ/data/activemq.log" 2>/dev/null \
@@ -129,6 +136,8 @@ fi
 sleep 10                                   # let the heap dump finish and the WARN reach the log
 LAST_ROWS=$(awk -F'\t' 'NR>1 && $2!="-" {r=$2} END {print (r=="" ? "-" : r)}' "$OUT/samples.tsv")
 ROWS=-; [ "$STORE" = jdbc ] && ROWS=$(sql "SELECT count(*) FROM activemq_msgs")
+# the subscriber is offline, so only the expiry task can move its last acked id
+LAST_ACKED=-; [ "$STORE" = jdbc ] && LAST_ACKED=$(sql "SELECT COALESCE(MAX(last_acked_id), 0) FROM activemq_acks")
 ALIVE=no; kill -0 "$PID" 2>/dev/null && ALIVE=yes
 
 # --- 8. evidence -------------------------------------------------------------------------------
@@ -146,10 +155,12 @@ shopt -s nullglob; TDS=("$OUT"/thread-dump-browse-*.txt); shopt -u nullglob
 set +e +o pipefail   # reporting only from here on
 PASS=no
 if [ "$EXPECT" = oom ]; then [ "$OOM" = yes ] && [ "$STACK" = yes ] && PASS=yes
+elif [ "$EXPECT" = expire ]; then
+  [ "$OOM" = no ] && [ "$ALIVE" = yes ] && [ "${LAST_ACKED:-0}" -gt 0 ] 2>/dev/null && PASS=yes
 else [ "$OOM" = no ] && [ "$ALIVE" = yes ] && PASS=yes; fi
 
 {
-  echo "### ActiveMQ $AMQ_VERSION, store=$STORE, expireMessagesPeriod=$EXPIRE_PERIOD"
+  echo "### ActiveMQ $AMQ_VERSION$( [ "$PATCHED" = yes ] && echo ' + patch'), store=$STORE, expireMessagesPeriod=$EXPIRE_PERIOD, TTL=$TTL ms"
   echo
   echo "| | |"; echo "|---|---|"
   echo "| expected | $EXPECT |"
@@ -159,6 +170,7 @@ else [ "$OOM" = no ] && [ "$ALIVE" = yes ] && PASS=yes; fi
   echo "| store rows at the last sample before the end/OOM | $LAST_ROWS |"
   echo "| thread dumps that caught Topic.doBrowse | ${#TDS[@]} |"
   echo "| rows in activemq_msgs at the end | $ROWS |"
+  echo "| subscription last acked id at the end (moved only by expiry) | $LAST_ACKED |"
   echo "| heap | $HEAP |"
   echo "| **result** | **$( [ $PASS = yes ] && echo PASS || echo FAIL )** |"
   echo
