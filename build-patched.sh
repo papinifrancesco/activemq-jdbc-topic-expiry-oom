@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Builds activemq-broker and activemq-jdbc-store from the release tag of AMQ_VERSION with
-# patches/jdbc-recover-expired.patch applied, into $WORK/patched/. repro.sh (PATCHED=yes)
-# then puts the two jars over the ones of the official binary distribution.
+# patches/jdbc-recover-expired.patch applied (or patches/jdbc-recover-expired-<version>.patch,
+# a backport, when it exists), into $WORK/patched/. repro.sh (PATCHED=yes) then puts the two
+# jars over the ones of the official binary distribution.
 #
 # Needs: git, maven, a JDK in JAVA_HOME accepted by the tag's build (6.2.x: 17+, 6.3.x: 24+).
 set -euo pipefail
 
 AMQ_VERSION=${AMQ_VERSION:-6.3.2}
 WORK=${WORK:-$PWD/work}
-PATCH=${PATCH:-$PWD/patches/jdbc-recover-expired.patch}
+PATCH=${PATCH:-$PWD/patches/jdbc-recover-expired-$AMQ_VERSION.patch}
+[ -f "$PATCH" ] || PATCH=$PWD/patches/jdbc-recover-expired.patch
 SRC="$WORK/activemq-src-$AMQ_VERSION"
 
 rm -rf "$SRC" "$WORK/patched"; mkdir -p "$WORK/patched"

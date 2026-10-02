@@ -1,0 +1,356 @@
+diff --git a/activemq-broker/src/main/java/org/apache/activemq/broker/region/Topic.java b/activemq-broker/src/main/java/org/apache/activemq/broker/region/Topic.java
+index d4c60aa74..43af22dd7 100644
+--- a/activemq-broker/src/main/java/org/apache/activemq/broker/region/Topic.java
++++ b/activemq-broker/src/main/java/org/apache/activemq/broker/region/Topic.java
+@@ -687,11 +687,14 @@ public class Topic extends BaseDestination implements Task {
+     public void doBrowse(final List<Message> browseList, final int max) {
+         try {
+             if (topicStore != null) {
++                // a JDBC ack moves the last acked id of the subscription, so expiring a browsed
++                // message would also ack the non-expired messages before it
++                final boolean expireFromStore = topicStore.getType() == StoreType.JDBC;
+                 final List<Message> toExpire = new ArrayList<Message>();
+                 topicStore.recover(new MessageRecoveryListener() {
+                     @Override
+                     public boolean recoverMessage(Message message) throws Exception {
+-                        if (message.isExpired()) {
++                        if (!expireFromStore && message.isExpired()) {
+                             toExpire.add(message);
+                         }
+                         browseList.add(message);
+@@ -727,6 +730,9 @@ public class Topic extends BaseDestination implements Task {
+                         }
+                     }
+                 }
++                if (expireFromStore) {
++                    expireFromStore(topicStore);
++                }
+                 Message[] msgs = subscriptionRecoveryPolicy.browse(getActiveMQDestination());
+                 if (msgs != null) {
+                     for (int i = 0; i < msgs.length && browseList.size() < max; i++) {
+@@ -891,61 +897,67 @@ public class Topic extends BaseDestination implements Task {
+         }
+     };
+ 
++    // Expires messages through TopicMessageStore.recoverExpired(), for the stores that support it
++    private void expireFromStore(TopicMessageStore store) throws Exception {
++        // get the sub keys that should be checked for expired messages
++        final var subs = durableSubscribers.entrySet().stream()
++                .filter(entry -> isEligibleForExpiration(entry.getValue()))
++                .map(Entry::getKey).collect(Collectors.toSet());
++
++        if (subs.isEmpty()) {
++            LOG.debug("Skipping topic expiration check for {}, no eligible subscriptions to check", destination);
++            return;
++        }
++
++        // For each eligible subscription, return the messages in the store that are expired
++        // The same message refs are shared between subs if duplicated so this is efficient
++        var expired = store.recoverExpired(subs, getMaxExpirePageSize(),
++                expiryListener);
++
++        final ConnectionContext connectionContext = createConnectionContext();
++        // Go through any expired messages and remove for each sub
++        for (Entry<SubscriptionKey, List<Message>> entry : expired.entrySet()) {
++            DurableTopicSubscription sub = durableSubscribers.get(entry.getKey());
++            List<Message> expiredMessages = entry.getValue();
++
++            // If the sub still exists and there are expired messages then process
++            if (sub != null && !expiredMessages.isEmpty()) {
++                // There's a small race condition here if the sub comes online,
++                // but it's not a big deal as at worst there maybe be duplicate acks for
++                // the expired message but the store can handle it
++                if (isEligibleForExpiration(sub)) {
++                    expiredMessages.forEach(message -> {
++                        message.setRegionDestination(Topic.this);
++                        try {
++                            // AMQ-9721 - Remove message from the cursor if it exists after
++                            // loading from the store.  Store recoverExpired() does not inc
++                            // the ref count so we don't need to decrement here, but if
++                            // the cursor finds its own copy in memory it will dec that ref.
++                            sub.removePending(message);
++                        } catch (IOException e) {
++                            throw new UncheckedIOException(e);
++                        }
++                        messageExpired(connectionContext, sub, message);
++                    });
++                }
++            }
++        }
++    }
++
+     private final AtomicBoolean expiryTaskInProgress = new AtomicBoolean(false);
+     private final Runnable expireMessagesWork = () -> {
+         try {
+             final TopicMessageStore store = Topic.this.topicStore;
+-            if (store != null && store.getType() == StoreType.KAHADB) {
+-                if (store.getMessageCount() == 0) {
++            if (store != null && (store.getType() == StoreType.KAHADB || store.getType() == StoreType.JDBC)) {
++                // the message count is a cheap index lookup for KahaDB but a COUNT query for JDBC
++                if (store.getType() == StoreType.KAHADB && store.getMessageCount() == 0) {
+                     LOG.debug("Skipping topic expiration check for {}, store size is 0", destination);
+                     return;
+                 }
+ 
+-                // get the sub keys that should be checked for expired messages
+-                final var subs = durableSubscribers.entrySet().stream()
+-                    .filter(entry -> isEligibleForExpiration(entry.getValue()))
+-                    .map(Entry::getKey).collect(Collectors.toSet());
+-
+-                if (subs.isEmpty()) {
+-                    LOG.debug("Skipping topic expiration check for {}, no eligible subscriptions to check", destination);
+-                    return;
+-                }
+-
+-                // For each eligible subscription, return the messages in the store that are expired
+-                // The same message refs are shared between subs if duplicated so this is efficient
+-                var expired = store.recoverExpired(subs, getMaxExpirePageSize(),
+-                    expiryListener);
+-
+-                final ConnectionContext connectionContext = createConnectionContext();
+-                // Go through any expired messages and remove for each sub
+-                for (Entry<SubscriptionKey, List<Message>> entry : expired.entrySet()) {
+-                    DurableTopicSubscription sub = durableSubscribers.get(entry.getKey());
+-                    List<Message> expiredMessages = entry.getValue();
+-
+-                    // If the sub still exists and there are expired messages then process
+-                    if (sub != null && !expiredMessages.isEmpty()) {
+-                        // There's a small race condition here if the sub comes online,
+-                        // but it's not a big deal as at worst there maybe be duplicate acks for
+-                        // the expired message but the store can handle it
+-                        if (isEligibleForExpiration(sub)) {
+-                            expiredMessages.forEach(message -> {
+-                                message.setRegionDestination(Topic.this);
+-                                try {
+-                                    // AMQ-9721 - Remove message from the cursor if it exists after
+-                                    // loading from the store.  Store recoverExpired() does not inc
+-                                    // the ref count so we don't need to decrement here, but if
+-                                    // the cursor finds its own copy in memory it will dec that ref.
+-                                    sub.removePending(message);
+-                                } catch (IOException e) {
+-                                    throw new UncheckedIOException(e);
+-                                }
+-                                messageExpired(connectionContext, sub, message);
+-                            });
+-                        }
+-                    }
+-                }
++                expireFromStore(store);
+             } else {
+-                // If not KahaDB, fall back to the legacy browse method because
++                // If not KahaDB or JDBC, fall back to the legacy browse method because
+                 // the recoverExpired() method is not supported
+                 doBrowse(new InsertionCountList<>(), getMaxExpirePageSize());
+             }
+diff --git a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCAdapter.java b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCAdapter.java
+index dc57b24e3..349044421 100644
+--- a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCAdapter.java
++++ b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCAdapter.java
+@@ -60,6 +60,9 @@ public interface JDBCAdapter {
+     void doRecoverNextMessages(TransactionContext c, ActiveMQDestination destination, String clientId, String subscriptionName, long seq, long priority, int maxReturned,
+                                JDBCMessageRecoveryListener listener) throws Exception;
+ 
++    void doRecoverExpired(TransactionContext c, ActiveMQDestination destination, String clientId, String subscriptionName, long now, int maxReturned,
++                          boolean isPrioritizedMessages, JDBCMessageRecoveryListener listener) throws Exception;
++
+     void doRecoverNextMessagesWithPriority(TransactionContext c, ActiveMQDestination destination, String clientId, String subscriptionName, long seq, long priority, int maxReturned,
+                                JDBCMessageRecoveryListener listener) throws Exception;
+ 
+diff --git a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCTopicMessageStore.java b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCTopicMessageStore.java
+index 26390ba30..e2be73b88 100644
+--- a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCTopicMessageStore.java
++++ b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/JDBCTopicMessageStore.java
+@@ -18,7 +18,9 @@ package org.apache.activemq.store.jdbc;
+ 
+ import java.io.IOException;
+ import java.sql.SQLException;
++import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.LinkedHashMap;
+@@ -362,10 +364,57 @@ public class JDBCTopicMessageStore extends JDBCMessageStore implements TopicMess
+         }
+     }
+ 
++    /**
++     * Returns, for each subscription, the expired messages it has not acked yet, oldest first.
++     * The ack table only keeps the last acked id of a subscription, so only the run of expired
++     * messages right after it is returned: acking a later expired message would also ack the
++     * non-expired messages before it. At most {@code max} distinct messages are loaded.
++     */
+     @Override
+     public Map<SubscriptionKey, List<Message>> recoverExpired(Set<SubscriptionKey> subs, int max,
+-        MessageRecoveryListener listener) {
+-        throw new UnsupportedOperationException("recoverExpired not supported");
++        MessageRecoveryListener listener) throws Exception {
++        final Map<SubscriptionKey, List<Message>> expired = new HashMap<>();
++        // a message pending for several subscriptions is unmarshalled and passed to the listener once
++        final Map<Long, Message> loaded = new HashMap<>();
++        final long now = System.currentTimeMillis();
++        TransactionContext c = persistenceAdapter.getTransactionContext();
++        try {
++            for (SubscriptionKey sub : subs) {
++                // no check on max here: messages already loaded for another subscription cost nothing
++                if (!listener.hasSpace()) {
++                    break;
++                }
++                adapter.doRecoverExpired(c, destination, sub.getClientId(), sub.getSubscriptionName(), now, max,
++                        isPrioritizedMessages(), new JDBCMessageRecoveryListener() {
++                    @Override
++                    public boolean recoverMessage(long sequenceId, byte[] data) throws Exception {
++                        Message msg = loaded.get(sequenceId);
++                        if (msg == null) {
++                            if (loaded.size() >= max || !listener.hasSpace()) {
++                                return false;
++                            }
++                            msg = (Message) wireFormat.unmarshal(new ByteSequence(data));
++                            msg.getMessageId().setBrokerSequenceId(sequenceId);
++                            loaded.put(sequenceId, msg);
++                            listener.recoverMessage(msg);
++                        }
++                        expired.computeIfAbsent(sub, k -> new ArrayList<>()).add(msg);
++                        return true;
++                    }
++
++                    @Override
++                    public boolean recoverMessageReference(String reference) {
++                        return false;
++                    }
++                });
++            }
++        } catch (SQLException e) {
++            JDBCPersistenceAdapter.log("JDBC Failure: ", e);
++            throw IOExceptionSupport.create("Failed to recover expired messages for: " + destination + ". Reason: " + e, e);
++        } finally {
++            c.close();
++        }
++        return expired;
+     }
+ 
+     /**
+diff --git a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/Statements.java b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/Statements.java
+index b61fe16c9..2a9daaafc 100644
+--- a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/Statements.java
++++ b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/Statements.java
+@@ -53,6 +53,8 @@ public class Statements {
+     private String findAllDurableSubMessagesStatement;
+     private String findDurableSubMessagesStatement;
+     private String findDurableSubMessagesByPriorityStatement;
++    private String findExpiredDurableSubMessagesStatement;
++    private String findExpiredDurableSubMessagesByPriorityStatement;
+     private String findAllDestinationsStatement;
+     private String removeAllMessagesStatement;
+     private String removeAllSubscriptionsStatement;
+@@ -336,6 +338,49 @@ public class Statements {
+         return findDurableSubMessagesByPriorityStatement;
+     }    
+ 
++    /**
++     * Expired messages still pending for a durable subscription, oldest first.
++     * The ack table only records the last acked id, so acking a message implicitly acks
++     * every earlier one: only the run of expired messages that directly follows the last
++     * acked id is returned, stopping at the first message that is not expired or is still
++     * part of a transaction. Parameters: container, client id, sub name, now, now.
++     */
++    public String getFindExpiredDurableSubMessagesStatement() {
++        if (findExpiredDurableSubMessagesStatement == null) {
++            findExpiredDurableSubMessagesStatement = "SELECT M.ID, M.MSG FROM " + getFullMessageTableName() + " M, "
++                                              + getFullAckTableName() + " D "
++                                              + " WHERE D.CONTAINER=? AND D.CLIENT_ID=? AND D.SUB_NAME=?"
++                                              + " AND D.XID IS NULL"
++                                              + " AND M.CONTAINER=D.CONTAINER AND M.ID > D.LAST_ACKED_ID"
++                                              + " AND M.XID IS NULL AND M.EXPIRATION > 0 AND M.EXPIRATION < ?"
++                                              + " AND M.ID < COALESCE((SELECT MIN(B.ID) FROM " + getFullMessageTableName() + " B"
++                                              + " WHERE B.CONTAINER=D.CONTAINER AND B.ID > D.LAST_ACKED_ID"
++                                              + " AND (B.XID IS NOT NULL OR B.EXPIRATION <= 0 OR B.EXPIRATION >= ?)), M.ID + 1)"
++                                              + " ORDER BY M.ID";
++        }
++        return findExpiredDurableSubMessagesStatement;
++    }
++
++    /**
++     * Same as {@link #getFindExpiredDurableSubMessagesStatement()} for prioritized messages,
++     * where the ack table holds one last acked id per priority.
++     */
++    public String getFindExpiredDurableSubMessagesByPriorityStatement() {
++        if (findExpiredDurableSubMessagesByPriorityStatement == null) {
++            findExpiredDurableSubMessagesByPriorityStatement = "SELECT M.ID, M.MSG FROM " + getFullMessageTableName() + " M, "
++                                              + getFullAckTableName() + " D "
++                                              + " WHERE D.CONTAINER=? AND D.CLIENT_ID=? AND D.SUB_NAME=?"
++                                              + " AND D.XID IS NULL"
++                                              + " AND M.CONTAINER=D.CONTAINER AND M.PRIORITY=D.PRIORITY AND M.ID > D.LAST_ACKED_ID"
++                                              + " AND M.XID IS NULL AND M.EXPIRATION > 0 AND M.EXPIRATION < ?"
++                                              + " AND M.ID < COALESCE((SELECT MIN(B.ID) FROM " + getFullMessageTableName() + " B"
++                                              + " WHERE B.CONTAINER=D.CONTAINER AND B.PRIORITY=D.PRIORITY AND B.ID > D.LAST_ACKED_ID"
++                                              + " AND (B.XID IS NOT NULL OR B.EXPIRATION <= 0 OR B.EXPIRATION >= ?)), M.ID + 1)"
++                                              + " ORDER BY M.ID";
++        }
++        return findExpiredDurableSubMessagesByPriorityStatement;
++    }
++
+     public String getNextDurableSubscriberMessageStatement() {
+         if (nextDurableSubscriberMessageStatement == null) {
+             nextDurableSubscriberMessageStatement = "SELECT M.ID, M.MSG FROM "
+@@ -884,6 +929,14 @@ public class Statements {
+         this.findDurableSubMessagesStatement = findDurableSubMessagesStatement;
+     }
+ 
++    public void setFindExpiredDurableSubMessagesStatement(String findExpiredDurableSubMessagesStatement) {
++        this.findExpiredDurableSubMessagesStatement = findExpiredDurableSubMessagesStatement;
++    }
++
++    public void setFindExpiredDurableSubMessagesByPriorityStatement(String findExpiredDurableSubMessagesByPriorityStatement) {
++        this.findExpiredDurableSubMessagesByPriorityStatement = findExpiredDurableSubMessagesByPriorityStatement;
++    }
++
+     /**
+      * @param nextDurableSubscriberMessageStatement the nextDurableSubscriberMessageStatement to set
+      */
+diff --git a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/adapter/DefaultJDBCAdapter.java b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/adapter/DefaultJDBCAdapter.java
+index 47823ee64..4e3505c11 100644
+--- a/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/adapter/DefaultJDBCAdapter.java
++++ b/activemq-jdbc-store/src/main/java/org/apache/activemq/store/jdbc/adapter/DefaultJDBCAdapter.java
+@@ -616,6 +616,41 @@ public class DefaultJDBCAdapter implements JDBCAdapter {
+         }
+     }
+ 
++    @Override
++    public void doRecoverExpired(TransactionContext c, ActiveMQDestination destination, String clientId,
++            String subscriptionName, long now, int maxReturned, boolean isPrioritizedMessages,
++            JDBCMessageRecoveryListener listener) throws Exception {
++        if (this.statements.isUseExternalMessageReferences()) {
++            // only references are stored, there is no message to check the expiration of
++            return;
++        }
++        PreparedStatement s = null;
++        ResultSet rs = null;
++        try {
++            s = c.getConnection().prepareStatement(isPrioritizedMessages ?
++                    this.statements.getFindExpiredDurableSubMessagesByPriorityStatement() :
++                    this.statements.getFindExpiredDurableSubMessagesStatement());
++            s.setMaxRows(Math.min(maxReturned, maxRows));
++            s.setString(1, destination.getQualifiedName());
++            s.setString(2, clientId);
++            s.setString(3, subscriptionName);
++            s.setLong(4, now);
++            s.setLong(5, now);
++            rs = s.executeQuery();
++            int count = 0;
++            while (rs.next() && count < maxReturned) {
++                if (listener.recoverMessage(rs.getLong(1), getBinaryData(rs, 2))) {
++                    count++;
++                } else {
++                    break;
++                }
++            }
++        } finally {
++            close(rs);
++            close(s);
++        }
++    }
++
+     @Override
+     public void doRecoverNextMessagesWithPriority(TransactionContext c, ActiveMQDestination destination, String clientId,
+             String subscriptionName, long seq, long priority, int maxReturned, JDBCMessageRecoveryListener listener) throws Exception {
