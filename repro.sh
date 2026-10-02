@@ -92,6 +92,7 @@ CLI=(env ACTIVEMQ_OPTS_MEMORY=-Xmx256M "$AMQ/bin/activemq")   # an array, so tim
 timeout 120 "${CLI[@]}" consumer --brokerUrl "$BROKER_URL" --destination "topic://$TOPIC" \
   --durable true --clientId repro-client --messageCount 0 > "$OUT/consumer.log" 2>&1
 log "offline durable subscription created"
+ACKED_START=0; [ "$STORE" = jdbc ] && ACKED_START=$(sql "SELECT COALESCE(MAX(last_acked_id), 0) FROM activemq_acks")
 
 # --- 6. sampler: store rows, heap use, and the first thread dump showing doRecover -------------
 printf 'utc\tstore_rows\theap_used_kb\n' > "$OUT/samples.tsv"
@@ -156,7 +157,7 @@ set +e +o pipefail   # reporting only from here on
 PASS=no
 if [ "$EXPECT" = oom ]; then [ "$OOM" = yes ] && [ "$STACK" = yes ] && PASS=yes
 elif [ "$EXPECT" = expire ]; then
-  [ "$OOM" = no ] && [ "$ALIVE" = yes ] && [ "${LAST_ACKED:-0}" -gt 0 ] 2>/dev/null && PASS=yes
+  [ "$OOM" = no ] && [ "$ALIVE" = yes ] && [ "${LAST_ACKED:-0}" -gt "${ACKED_START:-0}" ] 2>/dev/null && PASS=yes
 else [ "$OOM" = no ] && [ "$ALIVE" = yes ] && PASS=yes; fi
 
 {
@@ -170,7 +171,7 @@ else [ "$OOM" = no ] && [ "$ALIVE" = yes ] && PASS=yes; fi
   echo "| store rows at the last sample before the end/OOM | $LAST_ROWS |"
   echo "| thread dumps that caught Topic.doBrowse | ${#TDS[@]} |"
   echo "| rows in activemq_msgs at the end | $ROWS |"
-  echo "| subscription last acked id at the end (moved only by expiry) | $LAST_ACKED |"
+  echo "| subscription last acked id: start / end (moved only by expiry) | $ACKED_START / $LAST_ACKED |"
   echo "| heap | $HEAP |"
   echo "| **result** | **$( [ $PASS = yes ] && echo PASS || echo FAIL )** |"
   echo
